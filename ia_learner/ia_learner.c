@@ -11,14 +11,12 @@
 
 #include "../include/protocolo.h"
 
-/* Mutex para que los printf de distintos hilos no se mezclen en la consola */
 static pthread_mutex_t g_mutex_consola = PTHREAD_MUTEX_INITIALIZER;
 #define CONSOLA_LOCK()   pthread_mutex_lock(&g_mutex_consola)
 #define CONSOLA_UNLOCK() pthread_mutex_unlock(&g_mutex_consola)
 
 static volatile sig_atomic_t g_activo = 1;
 
-/* ─── DICCIONARIOS DE CLASIFICACIÓN ─── */
 static const char *DICC_CORREO[] = {
     "thank", "please", "regards", "meeting", "attached",
     "information", "update", "schedule", "team", "project", NULL
@@ -35,7 +33,6 @@ static const char **DICCIONARIOS[NUM_CLASES] = { DICC_CORREO, DICC_ARTICULO, DIC
 static const char *NOMBRE_CLASE[NUM_CLASES] = { "Correo electronico", "Articulo cientifico", "Reporte" };
 static const char *NOMBRE_USUARIO[] = { "Personal administrativo", "Personal tecnico", "Profesor", "Estudiante", "Indeterminado" };
 
-/* ─── TDA: BOLSA DE PALABRAS ─── */
 typedef struct {
     char palabra[TAM_MAX_PALABRA];
     int  frecuencia;
@@ -82,7 +79,6 @@ static int bolsa_frecuencia(const BolsaPalabras *b, const char *palabra) {
     return 0;
 }
 
-/* ─── TDA: DOCUMENTO / VENTANA ─── */
 typedef struct {
     int id_ventana;
     int en_uso;
@@ -103,7 +99,6 @@ typedef struct {
 
 static TablaDocumentos g_tabla;
 
-/* ─── FUNCIONES DE CLASIFICACIÓN ─── */
 static ClaseDocumento clasificar_documento(const BolsaPalabras *b, int id_ventana) {
     ClaseDocumento mejor = CLASE_DESCONOCIDA;
     int mejor_suma = -1;
@@ -144,17 +139,25 @@ static TipoUsuario inferir_tipo_usuario() {
     return USUARIO_INDETERMINADO;
 }
 
-/* ─── HILO PRINCIPAL DE EVALUACIÓN FINAL ─── */
+/* --- SOLUCION CONTEXTO: Bucle permanente y reinicio de variables --- */
 static void *hilo_clasificador(void *arg) {
     (void)arg;
-    pthread_mutex_lock(&g_tabla.mutex);
-    /* Espera asíncrona hasta que se hayan terminado todas las ventanas reportadas por el Launcher */
-    while (g_activo && !(g_tabla.total_esperado > 0 && g_tabla.terminados >= g_tabla.total_esperado)) {
-        pthread_cond_wait(&g_tabla.cambio, &g_tabla.mutex);
-    }
-    pthread_mutex_unlock(&g_tabla.mutex);
+    while (g_activo) {
+        pthread_mutex_lock(&g_tabla.mutex);
+        /* Espera asíncrona hasta que se terminen las ventanas esperadas de la ronda actual */
+        while (g_activo && !(g_tabla.total_esperado > 0 && g_tabla.terminados >= g_tabla.total_esperado)) {
+            pthread_cond_wait(&g_tabla.cambio, &g_tabla.mutex);
+        }
+        
+        if (!g_activo) {
+            pthread_mutex_unlock(&g_tabla.mutex);
+            break;
+        }
 
-    if (g_activo) {
+        /* Reiniciamos el esperado para obligarlo a dormir hasta que el Launcher vuelva a abrirse */
+        g_tabla.total_esperado = 0;
+        pthread_mutex_unlock(&g_tabla.mutex);
+
         TipoUsuario usuario = inferir_tipo_usuario();
         CONSOLA_LOCK();
         printf("\n================================================\n");
@@ -165,7 +168,6 @@ static void *hilo_clasificador(void *arg) {
     return NULL;
 }
 
-/* ─── HILO POR CADA CONEXIÓN TCP (VENTANA X11) ─── */
 static void *hilo_conexion(void *arg) {
     int fd = *(int *)arg;
     free(arg);
@@ -182,33 +184,38 @@ static void *hilo_conexion(void *arg) {
             if (strncmp(linea, PROTO_TOTAL, strlen(PROTO_TOTAL)) == 0) {
                 int total = atoi(linea + strlen(PROTO_TOTAL) + 1);
                 pthread_mutex_lock(&g_tabla.mutex);
+                
+                /* SOLUCION CONTEXTO: Limpiar la tabla de registros viejos cada que arranca el launcher */
+                for (int i = 0; i < MAX_VENTANAS; i++) {
+                    g_tabla.documentos[i].en_uso = 0;
+                    g_tabla.documentos[i].clase = CLASE_DESCONOCIDA;
+                    g_tabla.documentos[i].bolsa.tamano = 0;
+                    g_tabla.documentos[i].pos_palabra = 0;
+                    g_tabla.documentos[i].palabra_actual[0] = '\0';
+                }
+                g_tabla.terminados = 0;
                 g_tabla.total_esperado = total;
                 pthread_cond_broadcast(&g_tabla.cambio);
                 pthread_mutex_unlock(&g_tabla.mutex);
                 
                 CONSOLA_LOCK();
-                printf("[IALearner] Launcher informo: esperar %d ventana(s)\n", total);
+                printf("\n[IALearner] Launcher informo: esperar %d ventana(s)\n", total);
                 CONSOLA_UNLOCK();
                 close(fd);
                 return NULL;
             } 
             else if (strncmp(linea, PROTO_ID, strlen(PROTO_ID)) == 0) {
                 id_ventana = atoi(linea + strlen(PROTO_ID) + 1);
-                
                 pthread_mutex_lock(&g_tabla.mutex);
                 for (int i = 0; i < MAX_VENTANAS; i++) {
                     if (!g_tabla.documentos[i].en_uso) {
                         doc = &g_tabla.documentos[i];
-                        memset(doc, 0, sizeof(RegistroDocumento));
                         doc->id_ventana = id_ventana;
                         doc->en_uso = 1;
-                        doc->clase = CLASE_DESCONOCIDA;
-                        pthread_mutex_init(&doc->mutex, NULL);
                         break;
                     }
                 }
                 pthread_mutex_unlock(&g_tabla.mutex);
-                
                 CONSOLA_LOCK();
                 printf("[IALearner] Ventana %d conectada\n", id_ventana);
                 CONSOLA_UNLOCK();
@@ -228,6 +235,16 @@ static void *hilo_conexion(void *arg) {
                 }
                 pthread_mutex_unlock(&doc->mutex);
             } 
+            else if (strncmp(linea, PROTO_RET, strlen(PROTO_RET)) == 0 && doc) {
+                /* Capturar si presionó enter antes de un espacio */
+                pthread_mutex_lock(&doc->mutex);
+                if (doc->pos_palabra > 0) {
+                    bolsa_agregar(&doc->bolsa, doc->palabra_actual);
+                    doc->pos_palabra = 0;
+                    doc->palabra_actual[0] = '\0';
+                }
+                pthread_mutex_unlock(&doc->mutex);
+            }
             else if (strncmp(linea, PROTO_FIN, strlen(PROTO_FIN)) == 0) {
                 goto fin_ventana;
             }
@@ -253,7 +270,6 @@ fin_ventana:
     return NULL;
 }
 
-/* ─── FUNCIÓN PRINCIPAL MAIN ─── */
 int main(int argc, char *argv[]) {
     int puerto = PUERTO_DEFECTO;
     if (argc == 2) puerto = atoi(argv[1]);
@@ -261,6 +277,7 @@ int main(int argc, char *argv[]) {
     memset(&g_tabla, 0, sizeof(g_tabla));
     pthread_mutex_init(&g_tabla.mutex, NULL);
     pthread_cond_init(&g_tabla.cambio, NULL);
+    for (int i = 0; i < MAX_VENTANAS; i++) pthread_mutex_init(&g_tabla.documentos[i].mutex, NULL);
 
     pthread_t hilo_clf;
     pthread_create(&hilo_clf, NULL, hilo_clasificador, NULL);
