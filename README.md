@@ -45,84 +45,63 @@ Verifica que los tres binarios se hayan generado correctamente:
 
 ## Ejecución
 
-El sistema requiere **dos terminales**: una para el servidor IALearner y otra para el launcher.
+El sistema requiere **dos terminales**: una para el servidor y otra para el launcher.
 
-El servidor recibe dos parámetros:
+El IALearner recibe dos parámetros:
 
-    ./ia_learner/ia_learner <puerto> <P>
+    ./ia_learner/ia_learner <puerto> <P_oraciones>
 
 donde:
 
-- `<puerto>` es el puerto TCP donde escuchará el servidor.
-- `<P>` es la cantidad de oraciones que deben acumularse antes de formar un lote y enviarlo a los detectores.
+- `<puerto>` es el puerto TCP en el que escuchará el servidor.
+- `<P_oraciones>` es el tamaño de lote utilizado por el patrón Productor-Consumidor.
+- `P_oraciones` debe ser un valor entero entre 1 y 128.
 
-### Terminal 1 — IALearner
-
-Por ejemplo, para utilizar el puerto 9500 y procesar lotes de 1 oración:
-
-    ./ia_learner/ia_learner 9500 1
-
-Para trabajar con lotes de 2 oraciones:
+**Terminal 1 — servidor:**
 
     ./ia_learner/ia_learner 9500 2
 
-Para trabajar con lotes de 3 oraciones:
+Ejemplo:
 
-    ./ia_learner/ia_learner 9500 3
+    Agentic-OS V2 Iniciado (Puerto 9500 | P = 2)
+    Presiona Ctrl+C para detener el servidor.
 
-El servidor mostrará información sobre:
+**Terminal 2 — launcher:**
 
-- Las ventanas conectadas.
-- Las oraciones agregadas a la cola.
-- Los lotes enviados a los detectores.
-- El hilo y CPU utilizados para procesar cada documento.
-- La clase detectada.
-- Las coincidencias encontradas.
-- La frecuencia total acumulada.
-- El contexto de usuario inferido.
+    ./launcher/launcher <N_ventanas> [host] [puerto]
 
-### Terminal 2 — Launcher
+donde:
 
-El launcher recibe tres parámetros:
+- `<N_ventanas>` indica cuántas ventanas gráficas se crearán.
+- `N_ventanas` debe ser mayor o igual a `MAX_VENTANAS`.
+- `MAX_VENTANAS` está definido actualmente como 16 en `protocolo.h`.
+- `[host]` es opcional y por defecto utiliza `127.0.0.1`.
+- `[puerto]` es opcional y por defecto utiliza `9500`.
 
-    ./launcher/launcher <N_ventanas> <host> <puerto>
+Ejemplos:
 
-Por ejemplo:
-
-    ./launcher/launcher 1 127.0.0.1 9500
-
-Para lanzar 2 ventanas:
-
-    ./launcher/launcher 2 127.0.0.1 9500
-
-Para lanzar 3 ventanas:
-
-    ./launcher/launcher 3 127.0.0.1 9500
-
-Donde:
-
-- `<N_ventanas>` es la cantidad de ventanas X11 que se crearán.
-- `<host>` es la dirección IP del servidor IALearner.
-- `<puerto>` debe coincidir con el puerto utilizado por IALearner.
+    ./launcher/launcher 16
+    ./launcher/launcher 16 127.0.0.1 9500
 
 Al ejecutarse, el launcher:
 
-1. Notifica automáticamente al IALearner la cantidad de ventanas que participarán en la ronda.
+1. Notifica automáticamente `TOTAL <n>` al IALearner.
 2. Abre N ventanas gráficas mediante `fork()` + `execv()`.
-3. Asigna un identificador único a cada ventana.
-4. Despliega un menú interactivo en consola para monitorear o cerrar los procesos.
-5. Utiliza `SIGCHLD` para detectar la finalización de los procesos hijos.
+3. Mantiene un menú interactivo en consola para monitorear o cerrar los procesos.
+4. Utiliza `SIGCHLD` y `waitpid()` para detectar y recolectar los procesos hijos terminados.
 
-### Uso de cada ventana gráfica
+## Uso de cada ventana gráfica
 
 - Haz clic sobre la ventana para darle el foco.
-- Escribe palabras o frases en inglés; cada tecla imprimible se envía carácter por carácter al servidor.
-- La ventana muestra en tiempo real el texto escrito.
-- Presiona **Enter** para finalizar una oración.
+- Escribe palabras en inglés libremente; cada tecla imprimible se envía carácter por carácter al servidor.
+- La ventana dibuja en tiempo real los caracteres escritos.
+- Presiona **Enter** para enviar la oración completa y limpiar la interfaz para comenzar una nueva.
 - Presiona **Escape** para cerrar la ventana.
-- Las oraciones de cada ventana se almacenan independientemente para evitar mezclar sus frecuencias y clasificación.
+- El launcher detecta el cierre mediante `SIGCHLD` y recolecta el proceso hijo para evitar procesos zombie.
 
-Cuando todas las ventanas lanzadas terminan, el IALearner evalúa las evidencias obtenidas y muestra el **contexto final del usuario**.
+> **Nota sobre Backspace:** La tecla Backspace solo modifica visualmente el texto mostrado en la ventana. No se envía un evento de Backspace al IALearner, por lo que el servidor conserva los caracteres previamente enviados mediante `CHAR`. Por esta razón, el texto visual de la ventana puede diferir del texto que finalmente procesa el servidor.
+
+Cuando se completan las condiciones de procesamiento, el IALearner evalúa las frecuencias obtenidas y muestra el contexto de usuario inferido.
 
 ## Protocolo interno (IPC vía sockets TCP)
 
@@ -134,9 +113,13 @@ Cada línea enviada por socket termina en un salto de línea. Los mensajes váli
 | `CHAR <c>` | ventana → IALearner | Se presionó la tecla imprimible c |
 | `RET` | ventana → IALearner | Se presionó Enter (fin de oración) |
 | `FIN` | ventana → IALearner | La ventana se cerró (Escape) |
-| `TOTAL <n>` | launcher → IALearner | Avisa cuántas ventanas participarán en la ronda |
+| `TOTAL <n>` | launcher → IALearner | Avisa cuántas ventanas esperar en la ronda |
 
-El launcher utiliza una conexión TCP corta para enviar `TOTAL`. Cada ventana gráfica mantiene su propia conexión TCP durante toda su ejecución, enviando los caracteres de forma asíncrona al servidor.
+El launcher utiliza una conexión TCP corta para enviar `TOTAL` e inicializar el estado del servidor.
+
+Cada ventana gráfica mantiene su propia conexión TCP durante toda su ejecución, enviando los mensajes `CHAR`, `RET` y `FIN`.
+
+El servidor atiende cada conexión mediante un hilo independiente utilizando `pthread_create()`.
 
 ## Diccionarios de clasificación (Bag of Words)
 
@@ -144,158 +127,165 @@ El launcher utiliza una conexión TCP corta para enviar `TOTAL`. Cada ventana gr
 |---|---|---|
 | thank, please, regards, meeting, attached, information, update, schedule, team, project | data, analysis, results, method, study, model, research, system, significant, effect | system, data, network, security, application, server, user, performance, service, infrastructure |
 
-Un documento (ventana) se clasifica en una clase si aparecen al menos **3 coincidencias** de su diccionario (controlado por `MIN_COINCIDENCIAS`).
+Un documento se clasifica en una clase si aparecen al menos **3 coincidencias** de su diccionario, controlado mediante `MIN_COINCIDENCIAS`.
 
-Si un documento califica para más de una clase, se considera la frecuencia total acumulada de las coincidencias para determinar la clase correspondiente.
+Si un documento califica para más de una clase, se asigna la clase que tenga la **mayor frecuencia total acumulada**.
+
+## Procesamiento por lotes
+
+El IALearner implementa un patrón **Productor-Consumidor**.
+
+Las oraciones recibidas desde las ventanas se almacenan en una cola compartida.
+
+El hilo **Loader** espera hasta disponer de `P` oraciones:
+
+    P = parámetro recibido al iniciar el IALearner
+
+Cuando la cola alcanza `P` elementos:
+
+1. El Loader extrae exactamente `P` oraciones.
+2. Las coloca en el lote de trabajo.
+3. Despierta a los hilos detectores.
+4. Cada detector procesa una oración.
+5. El Loader espera a que los `P` detectores terminen.
+6. Se continúa con el siguiente lote.
+
+La cola utiliza:
+
+- `pthread_mutex_t` para proteger el acceso concurrente.
+- `pthread_cond_t` para despertar al Loader cuando hay suficientes oraciones.
+- Un buffer circular de tamaño `MAX_COLA`.
 
 ## Inferencia de tipo de usuario
 
-Una vez terminan todos los procesos esperados, se evalúa qué clases de documento resultaron presentes y se compara contra la tabla de perfiles:
+Una vez procesadas las oraciones, se determina qué clases de documento fueron detectadas y se compara la evidencia global contra la siguiente tabla:
 
 | Tipo de usuario | Correo | Artículo | Reporte |
-|---|:---:|:---:|:---:|
-| Personal administrativo | X | - | X |
-| Personal técnico | X | - | - |
-| Profesor | X | X | - |
-| Estudiante | - | X | X |
+|---|---|---|---|
+| Personal administrativo | X | | X |
+| Personal técnico | X | | |
+| Profesor | X | X | |
+| Estudiante | | X | X |
 
-Los cuatro patrones de la tabla representan las combinaciones válidas de evidencias utilizadas para inferir el contexto del usuario.
+Los patrones utilizados son:
 
-- **Personal administrativo:** evidencia de Correo y Reporte.
-- **Personal técnico:** evidencia únicamente de Correo.
-- **Profesor:** evidencia de Correo y Artículo.
-- **Estudiante:** evidencia de Artículo y Reporte.
+- **Personal administrativo:** Correo + Reporte
+- **Personal técnico:** Correo
+- **Profesor:** Correo + Artículo
+- **Estudiante:** Artículo + Reporte
 
-Si las evidencias obtenidas no coinciden exactamente con ninguno de los cuatro patrones definidos, el contexto se muestra como **Indeterminado**.
+Si la combinación de evidencia no coincide con ninguno de estos patrones, el sistema determina el usuario como **Indeterminado**.
 
-## Notas de diseño (Concurrencia y Programación Defensiva)
+> **Nota de diseño:** Las evidencias de cada clase se almacenan de forma binaria: una clase cuenta como presente cuando al menos un documento ha sido clasificado con dicha etiqueta.
 
-- **IALearner (Servidor):** Acepta múltiples conexiones TCP y atiende cada una en un hilo independiente mediante `pthread_create`.
-- **Bag of Words independiente:** Cada ventana mantiene su propio documento y sus propias frecuencias, evitando que las palabras de diferentes ventanas se mezclen.
-- **Sincronización:** Los datos compartidos entre hilos se protegen mediante mutex para evitar condiciones de carrera.
-- **Procesamiento por lotes:** Las oraciones se almacenan en una cola y se procesan cuando se alcanza el valor `P` configurado al iniciar IALearner.
-- **Hilos de detección:** Los documentos son procesados mediante hilos de trabajo y se muestra el hilo y el CPU utilizados durante la clasificación.
-- **Consola Segura:** La impresión en el servidor se protege mediante un mutex global para evitar que mensajes de distintos hilos se mezclen en la terminal.
-- **Launcher:** Utiliza un manejador de `SIGCHLD` con `waitpid(-1, &estado, WNOHANG)` para recolectar los procesos hijos terminados y evitar procesos zombie.
-- **Procesos independientes:** Cada ventana gráfica se ejecuta como un proceso independiente creado mediante `fork()` y `execv()`.
+## Concurrencia y programación defensiva
 
-## Pruebas realizadas
+### IALearner
 
-El sistema fue probado con diferentes configuraciones para verificar su funcionamiento.
+- Acepta múltiples conexiones TCP.
+- Cada conexión es atendida mediante un hilo independiente.
+- Los detectores trabajan concurrentemente utilizando `pthread`.
+- Cada documento posee su propio `pthread_mutex_t`, protegiendo su Bolsa de Palabras y sus resultados.
+- La cola de oraciones posee un mutex y una variable de condición.
+- El Loader utiliza `pthread_cond_wait()` para evitar espera activa.
+- Los detectores utilizan variables de condición para sincronizar el procesamiento de cada lote.
+- La salida por consola está protegida mediante `g_mutex_consola`, evitando que varios hilos mezclen sus mensajes.
+- Los hilos detectores se asocian a CPUs mediante `pthread_setaffinity_np()` cuando el sistema lo permite.
+- Se utilizan límites estáticos definidos en `protocolo.h` para controlar el uso de memoria.
 
-### Prueba con una ventana y P = 1
+### Launcher
 
-    ./ia_learner/ia_learner 9500 1
-    ./launcher/launcher 1 127.0.0.1 9500
+- Utiliza `fork()` + `execv()` para crear cada ventana.
+- Utiliza `SIGCHLD` para detectar procesos hijos terminados.
+- Utiliza `waitpid(-1, &estado, WNOHANG)` para recolectar procesos terminados sin bloquear el menú.
+- Permite cerrar todas las ventanas mediante `SIGTERM`.
+- Ignora `SIGPIPE` para evitar la terminación inesperada ante conexiones cerradas.
 
-Se verificó:
+### Cliente X11
 
-- Conexión correcta de la ventana.
-- Procesamiento de cada oración.
-- Clasificación mediante Bag of Words.
-- Acumulación de frecuencias.
-- Inferencia del contexto de usuario.
+- Utiliza Xlib para crear las ventanas.
+- Captura eventos de teclado mediante `KeyPressMask`.
+- Envía las teclas imprimibles al servidor mediante mensajes `CHAR`.
+- Mantiene un búfer local para mostrar visualmente el texto escrito.
+- Permite borrar caracteres visualmente mediante Backspace.
+- Utiliza `SIGPIPE` ignorado y `MSG_NOSIGNAL` al enviar datos por socket.
 
-### Prueba con múltiples ventanas y P = 3
+## Límites del sistema
 
-    ./ia_learner/ia_learner 9500 3
-    ./launcher/launcher 3 127.0.0.1 9500
+Los principales límites están definidos en `protocolo.h`:
 
-Se verificó:
+| Constante | Valor | Descripción |
+|---|---:|---|
+| `MAX_VENTANAS` | 16 | Límite de ventanas/procesos soportados |
+| `TAM_MAX_MSG` | 64 | Tamaño máximo de un mensaje del protocolo |
+| `TAM_MAX_ORACION` | 512 | Tamaño máximo de una oración |
+| `TAM_MAX_PALABRA` | 32 | Tamaño máximo de una palabra |
+| `MAX_VOCABULARIO` | 64 | Máximo de palabras almacenadas por documento |
+| `MAX_COLA` | 1000 | Capacidad máxima de la cola de oraciones |
+| `MIN_COINCIDENCIAS` | 3 | Coincidencias mínimas para clasificar un documento |
 
-- Registro de múltiples ventanas.
-- Acumulación de P oraciones.
-- Procesamiento de lotes.
-- Uso de diferentes hilos y CPU.
-- Clasificación independiente de los documentos.
-- Finalización correcta de todas las ventanas.
-
-### Prueba de independencia entre ventanas
-
-Se utilizaron dos ventanas con múltiples oraciones:
-
-    ./ia_learner/ia_learner 9500 2
-    ./launcher/launcher 2 127.0.0.1 9500
-
-Se comprobó que cada ventana conserva su propio **Bag of Words**, frecuencias y clasificación.
-
-Por ejemplo:
-
-    Documento: 1
-    Clase: CORREO
-    Frecuencia total: 3
-
-    Documento: 1
-    Clase: CORREO
-    Frecuencia total: 6
-
-mientras otra ventana mantiene sus propios valores:
-
-    Documento: 2
-    Clase: REPORTE
-    Frecuencia total: 3
-
-    Documento: 2
-    Clase: REPORTE
-    Frecuencia total: 4
-
-Esto demuestra que las frecuencias de las diferentes ventanas no se mezclan.
+El parámetro `P` del IALearner debe estar entre **1 y 128**.
 
 ## Solución de problemas
 
 ### `bind: Address already in use`
 
-Significa que otro proceso está utilizando el puerto seleccionado.
+Quedó un servidor ejecutándose en segundo plano.
 
-Verifica qué proceso utiliza el puerto:
+Verifica qué proceso está utilizando el puerto:
 
     lsof -i :9500
 
-Si es necesario, termina el proceso:
+Luego puedes finalizarlo:
 
     kill -9 <PID>
 
-Después vuelve a iniciar IALearner.
+### `Launcher dice error de conexión`
 
-### Launcher dice error de conexión
+Asegúrate de levantar primero el IALearner:
 
-Asegúrate de iniciar primero el servidor:
+    ./ia_learner/ia_learner 9500 2
 
-    ./ia_learner/ia_learner 9500 1
+Después ejecuta el launcher:
 
-y después el launcher:
+    ./launcher/launcher 16
 
-    ./launcher/launcher 1 127.0.0.1 9500
+También verifica que el host y puerto utilizados por ambos programas coincidan.
 
-Comprueba que el puerto utilizado en ambos comandos sea el mismo.
+### `N_ventanas inválido`
+
+El launcher requiere que el número de ventanas sea **mayor o igual a `MAX_VENTANAS`**.
+
+Actualmente:
+
+    MAX_VENTANAS = 16
+
+Por lo tanto, utiliza:
+
+    ./launcher/launcher 16
+
+o un valor superior.
+
+### `P inválido`
+
+El segundo parámetro del IALearner debe encontrarse entre 1 y 128:
+
+    ./ia_learner/ia_learner 9500 2
 
 ### La ventana gráfica no aparece
 
-Confirma que existe un servidor X11 disponible:
+Confirma que tienes un servidor X11 funcionando:
 
     echo $DISPLAY
 
-El comando no debe devolver una cadena vacía.
+El resultado no debe estar vacío.
 
-En WSL puede ser necesario configurar un servidor X11 como VcXsrv y establecer correctamente la variable `DISPLAY`.
+En Windows/WSL puedes utilizar VcXsrv y configurar correctamente la variable `DISPLAY`.
 
-### El contexto aparece como `Indeterminado`
+### El texto visual no coincide con el texto procesado
 
-Esto ocurre cuando las evidencias globales obtenidas no coinciden con ninguno de los cuatro patrones definidos:
+Esto puede ocurrir si se utiliza **Backspace**.
 
-| Correo | Artículo | Reporte | Resultado |
-|:---:|:---:|:---:|---|
-| X | - | X | Personal administrativo |
-| X | - | - | Personal técnico |
-| X | X | - | Profesor |
-| - | X | X | Estudiante |
+El Backspace actualmente solamente modifica el texto mostrado en la ventana y no envía ninguna instrucción al IALearner para eliminar el carácter previamente enviado.
 
-Por ejemplo:
-
-    Correo: SI
-    Articulo: SI
-    Reporte: SI
-
-no coincide con ningún patrón y, por lo tanto, el resultado es:
-
-    Contexto: Indeterminado
+Por lo tanto, el servidor puede conservar un carácter que visualmente ya no aparece en la ventana.
