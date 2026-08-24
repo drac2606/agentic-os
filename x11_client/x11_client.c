@@ -28,11 +28,38 @@ static int conectar_ia_learner(const char *host, int puerto) {
     return fd;
 }
 
-static void enviar_mensaje(int fd_socket, const char *mensaje) {
-    if (fd_socket < 0) return;
+static void enviar_mensaje(int fd_socket, const char *mensaje)
+{
+    if (fd_socket < 0)
+        return;
+
     char buffer[TAM_MAX_MSG];
-    snprintf(buffer, sizeof(buffer), "%s\n", mensaje);
-    send(fd_socket, buffer, strlen(buffer), MSG_NOSIGNAL);
+
+    int longitud = snprintf(
+        buffer,
+        sizeof(buffer),
+        "%s\n",
+        mensaje
+    );
+
+    if (longitud <= 0)
+        return;
+
+    size_t enviados = 0;
+
+    while (enviados < (size_t)longitud) {
+        ssize_t n = send(
+            fd_socket,
+            buffer + enviados,
+            (size_t)longitud - enviados,
+            MSG_NOSIGNAL
+        );
+
+        if (n <= 0)
+            break;
+
+        enviados += (size_t)n;
+    }
 }
 
 int main(int argc, char *argv[]) {
