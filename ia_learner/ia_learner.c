@@ -1,41 +1,43 @@
+#define _GNU_SOURCE /* Requerido obligatoriamente para habilitar la Afinidad de CPU en Linux */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <sched.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
-#include <errno.h>
-#include <signal.h>
 #include <ctype.h>
 
 #include "../include/protocolo.h"
 
+/* ─── PROTECCIÓN DE CONSOLA ───
+   Evita que los printf de los detectores concurrentes se entrelacen en pantalla. */
 static pthread_mutex_t g_mutex_consola = PTHREAD_MUTEX_INITIALIZER;
 #define CONSOLA_LOCK()   pthread_mutex_lock(&g_mutex_consola)
 #define CONSOLA_UNLOCK() pthread_mutex_unlock(&g_mutex_consola)
 
 static volatile sig_atomic_t g_activo = 1;
 
-static const char *DICC_CORREO[] = {
-    "thank", "please", "regards", "meeting", "attached",
-    "information", "update", "schedule", "team", "project", NULL
-};
-static const char *DICC_ARTICULO[] = {
-    "data", "analysis", "results", "method", "study",
-    "model", "research", "system", "significant", "effect", NULL
-};
-static const char *DICC_REPORTE[] = {
-    "system", "data", "network", "security", "application",
-    "server", "user", "performance", "service", "infrastructure", NULL
-};
-static const char **DICCIONARIOS[NUM_CLASES] = { DICC_CORREO, DICC_ARTICULO, DICC_REPORTE };
-static const char *NOMBRE_CLASE[NUM_CLASES] = { "Correo electronico", "Articulo cientifico", "Reporte" };
-static const char *NOMBRE_USUARIO[] = { "Personal administrativo", "Personal tecnico", "Profesor", "Estudiante", "Indeterminado" };
+/* ─── VARIABLES GLOBALES V2 (ORQUESTACIÓN Y LOTES) ─── */
+static ColaOraciones g_cola;
+static int g_parametro_p = 0; /* Límite de hilos y tamaño exacto del lote a procesar */
+
+/* Lote temporal donde el Loader extrae las P oraciones para los detectores */
+static Oracion *g_lote_trabajo;
+static int g_oraciones_en_lote = 0;
+static pthread_mutex_t g_mutex_lote = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_cond_detectores = PTHREAD_COND_INITIALIZER;
+
+/* ─── DICCIONARIOS Y BAG OF WORDS ─── */
+static const char *DICC_CORREO[] = {"thank", "please", "regards", "meeting", "attached", "information", "update", "schedule", "team", "project", NULL};
+static const char *DICC_ARTICULO[] = {"data", "analysis", "results", "method", "study", "model", "research", "system", "significant", "effect", NULL};
+static const char *DICC_REPORTE[] = {"system", "data", "network", "security", "application", "server", "user", "performance", "service", "infrastructure", NULL};
+static const char *NOMBRE_USUARIO[] = {"Personal administrativo", "Personal tecnico", "Profesor", "Estudiante", "Indeterminado"};
 
 typedef struct {
     char palabra[TAM_MAX_PALABRA];
-    int  frecuencia;
+    int frecuencia;
 } EntradaFrecuencia;
 
 typedef struct {
@@ -43,16 +45,29 @@ typedef struct {
     int tamano;
 } BolsaPalabras;
 
-static void a_minusculas(const char *origen, char *destino, size_t n) {
+typedef struct {
+    int id_ventana;
+    int en_uso;
+    BolsaPalabras bolsa;
+    ClaseDocumento clase;
+    int evaluado;
+    pthread_mutex_t mutex; /* Mutex granular por ventana */
+} RegistroDocumento;
+
+static RegistroDocumento g_documentos[MAX_VENTANAS];
+static pthread_mutex_t g_mutex_docs = PTHREAD_MUTEX_INITIALIZER;
+
+/* ─── FUNCIONES AUXILIARES ─── */
+static void a_minusculas(const char *origen, char *destino, size_t max_len) {
     size_t i;
-    for (i = 0; i < n - 1 && origen[i]; i++) {
-        destino[i] = (char)tolower((unsigned char)origen[i]);
+    for (i = 0; i < max_len - 1 && origen[i] != '\0'; i++) {
+        destino[i] = tolower((unsigned char)origen[i]);
     }
     destino[i] = '\0';
 }
 
 static void bolsa_agregar(BolsaPalabras *b, const char *palabra) {
-    if (!palabra || palabra[0] == '\0') return;
+    if (strlen(palabra) == 0) return;
     char minus[TAM_MAX_PALABRA];
     a_minusculas(palabra, minus, sizeof(minus));
 
@@ -69,181 +84,206 @@ static void bolsa_agregar(BolsaPalabras *b, const char *palabra) {
     }
 }
 
-static int bolsa_frecuencia(const BolsaPalabras *b, const char *palabra) {
-    char minus[TAM_MAX_PALABRA];
-    a_minusculas(palabra, minus, sizeof(minus));
-    for (int i = 0; i < b->tamano; i++) {
-        if (strncmp(b->entradas[i].palabra, minus, TAM_MAX_PALABRA) == 0)
-            return b->entradas[i].frecuencia;
+static int contar_coincidencias(BolsaPalabras *b, const char **diccionario, int *freq_total) {
+    int coincidencias = 0;
+    *freq_total = 0;
+    for (int i = 0; diccionario[i] != NULL; i++) {
+        char minus_dicc[TAM_MAX_PALABRA];
+        a_minusculas(diccionario[i], minus_dicc, sizeof(minus_dicc));
+        for (int j = 0; j < b->tamano; j++) {
+            if (strncmp(b->entradas[j].palabra, minus_dicc, TAM_MAX_PALABRA) == 0) {
+                coincidencias++;
+                *freq_total += b->entradas[j].frecuencia;
+                break;
+            }
+        }
     }
-    return 0;
+    return coincidencias;
 }
 
-typedef struct {
-    int id_ventana;
-    int en_uso;
-    BolsaPalabras bolsa;
-    ClaseDocumento clase;
-    char palabra_actual[TAM_MAX_PALABRA];
-    int pos_palabra;
-    pthread_mutex_t mutex;
-} RegistroDocumento;
+static ClaseDocumento clasificar_documento(BolsaPalabras *b) {
+    int f_correo = 0, f_articulo = 0, f_reporte = 0;
+    int c_correo = contar_coincidencias(b, DICC_CORREO, &f_correo);
+    int c_articulo = contar_coincidencias(b, DICC_ARTICULO, &f_articulo);
+    int c_reporte = contar_coincidencias(b, DICC_REPORTE, &f_reporte);
 
-typedef struct {
-    RegistroDocumento documentos[MAX_VENTANAS];
-    int terminados;
-    int total_esperado;
-    pthread_mutex_t mutex;
-    pthread_cond_t cambio;
-} TablaDocumentos;
+    ClaseDocumento mejor_clase = CLASE_DESCONOCIDA;
+    int max_freq = -1;
 
-static TablaDocumentos g_tabla;
+    if (c_correo >= MIN_COINCIDENCIAS && f_correo > max_freq) { mejor_clase = CLASE_CORREO; max_freq = f_correo; }
+    if (c_articulo >= MIN_COINCIDENCIAS && f_articulo > max_freq) { mejor_clase = CLASE_ARTICULO; max_freq = f_articulo; }
+    if (c_reporte >= MIN_COINCIDENCIAS && f_reporte > max_freq) { mejor_clase = CLASE_REPORTE; max_freq = f_reporte; }
 
-static ClaseDocumento clasificar_documento(const BolsaPalabras *b, int id_ventana) {
-    ClaseDocumento mejor = CLASE_DESCONOCIDA;
-    int mejor_suma = -1;
-
-    CONSOLA_LOCK();
-    printf("\n[IALearner] Clasificando ventana %d:\n", id_ventana);
-    for (int c = 0; c < NUM_CLASES; c++) {
-        int matches = 0, suma = 0;
-        for (int i = 0; DICCIONARIOS[c][i] != NULL; i++) {
-            int f = bolsa_frecuencia(b, DICCIONARIOS[c][i]);
-            if (f > 0) { suma += f; matches++; }
-        }
-        printf("  %-22s -> %d coincidencias, frec. total = %d", NOMBRE_CLASE[c], matches, suma);
-        if (matches >= MIN_COINCIDENCIAS) {
-            printf(" [ELEGIBLE]");
-            if (suma > mejor_suma) { mejor_suma = suma; mejor = (ClaseDocumento)c; }
-        }
-        printf("\n");
-    }
-    if (mejor != CLASE_DESCONOCIDA) printf("  -> Clase asignada: %s\n", NOMBRE_CLASE[mejor]);
-    CONSOLA_UNLOCK();
-    return mejor;
+    return mejor_clase;
 }
 
-static TipoUsuario inferir_tipo_usuario() {
+static TipoUsuario inferir_tipo_usuario_asincrono() {
     int correo = 0, articulo = 0, reporte = 0;
+    
+    pthread_mutex_lock(&g_mutex_docs);
     for (int i = 0; i < MAX_VENTANAS; i++) {
-        if (!g_tabla.documentos[i].en_uso) continue;
-        if (g_tabla.documentos[i].clase == CLASE_CORREO) correo = 1;
-        if (g_tabla.documentos[i].clase == CLASE_ARTICULO) articulo = 1;
-        if (g_tabla.documentos[i].clase == CLASE_REPORTE) reporte = 1;
+        if (!g_documentos[i].en_uso) continue;
+        if (g_documentos[i].clase == CLASE_CORREO) correo = 1;
+        if (g_documentos[i].clase == CLASE_ARTICULO) articulo = 1;
+        if (g_documentos[i].clase == CLASE_REPORTE) reporte = 1;
     }
+    pthread_mutex_unlock(&g_mutex_docs);
 
-    if (correo && !articulo && !reporte) return USUARIO_ADMINISTRATIVO;
-    if (correo && !articulo && reporte) return USUARIO_TECNICO;
+    if (correo && !articulo && reporte) return USUARIO_ADMINISTRATIVO;
+    if (correo && !articulo && !reporte) return USUARIO_TECNICO;
     if (correo && articulo && !reporte) return USUARIO_PROFESOR;
     if (!correo && articulo && reporte) return USUARIO_ESTUDIANTE;
+    
     return USUARIO_INDETERMINADO;
 }
 
-/* --- SOLUCION CONTEXTO: Bucle permanente y reinicio de variables --- */
-static void *hilo_clasificador(void *arg) {
-    (void)arg;
+/* ─── HILO DETECTOR (CONSUMIDOR ASINCRÓNICO V2) ─── 
+   Requisito 7: Procesamiento simultáneo de oraciones limitados a P hilos. */
+static void *hilo_detector(void *arg) {
+    int id_hilo = *(int*)arg;
+    free(arg);
+
+    /* REQUISITO 7a: Balancear la carga en CPUs disponibles (Afinidad de CPU) 
+       Asigna este hilo a un núcleo físico específico del procesador. */
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    int num_cores = sysconf(_SC_NPROCESSORS_ONLN);
+    CPU_SET(id_hilo % num_cores, &cpuset);
+    pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+
     while (g_activo) {
-        pthread_mutex_lock(&g_tabla.mutex);
-        /* Espera asíncrona hasta que se terminen las ventanas esperadas de la ronda actual */
-        while (g_activo && !(g_tabla.total_esperado > 0 && g_tabla.terminados >= g_tabla.total_esperado)) {
-            pthread_cond_wait(&g_tabla.cambio, &g_tabla.mutex);
+        pthread_mutex_lock(&g_mutex_lote);
+        /* Espera pasiva: El hilo no consume CPU hasta que el Loader lo despierte */
+        while (g_oraciones_en_lote == 0 && g_activo) {
+            pthread_cond_wait(&g_cond_detectores, &g_mutex_lote);
         }
-        
-        if (!g_activo) {
-            pthread_mutex_unlock(&g_tabla.mutex);
-            break;
+        if (!g_activo) { pthread_mutex_unlock(&g_mutex_lote); break; }
+
+        /* Extrae asincrónicamente una oración del lote simultáneamente con los demás hilos */
+        Oracion mi_oracion = g_lote_trabajo[--g_oraciones_en_lote];
+        pthread_mutex_unlock(&g_mutex_lote);
+
+        RegistroDocumento *doc = NULL;
+        pthread_mutex_lock(&g_mutex_docs);
+        for (int i = 0; i < MAX_VENTANAS; i++) {
+            if (g_documentos[i].en_uso && g_documentos[i].id_ventana == mi_oracion.id_ventana) {
+                doc = &g_documentos[i];
+                break;
+            }
         }
+        pthread_mutex_unlock(&g_mutex_docs);
 
-        /* Reiniciamos el esperado para obligarlo a dormir hasta que el Launcher vuelva a abrirse */
-        g_tabla.total_esperado = 0;
-        pthread_mutex_unlock(&g_tabla.mutex);
-
-        TipoUsuario usuario = inferir_tipo_usuario();
-        CONSOLA_LOCK();
-        printf("\n================================================\n");
-        printf("  CONTEXTO DE USUARIO DETECTADO: %s\n", NOMBRE_USUARIO[usuario]);
-        printf("================================================\n\n");
-        CONSOLA_UNLOCK();
+        /* REQUISITO 7f: Evaluar asincrónicamente apenas se procesa la oración */
+        if (doc) {
+            pthread_mutex_lock(&doc->mutex);
+            char *guardado, *palabra = strtok_r(mi_oracion.texto, " ", &guardado);
+            while (palabra != NULL) {
+                bolsa_agregar(&doc->bolsa, palabra);
+                palabra = strtok_r(NULL, " ", &guardado);
+            }
+            
+            ClaseDocumento clase_nueva = clasificar_documento(&doc->bolsa);
+            if (clase_nueva != CLASE_DESCONOCIDA && clase_nueva != doc->clase) {
+                doc->clase = clase_nueva;
+                doc->evaluado = 1;
+                
+                TipoUsuario tipo = inferir_tipo_usuario_asincrono();
+                CONSOLA_LOCK();
+                printf("\n[Hilo %d | CPU Core %d] Contexto Actualizado: %s\n", id_hilo, id_hilo % num_cores, NOMBRE_USUARIO[tipo]);
+                CONSOLA_UNLOCK();
+            }
+            pthread_mutex_unlock(&doc->mutex);
+        }
     }
     return NULL;
 }
 
+/* ─── HILO LOADER (ORQUESTADOR DE LOTES V2) ─── 
+   Requisito 7e: Hilo dedicado a verificar si hay P oraciones listas para reactivar los hilos suspendidos. */
+static void *hilo_loader(void *arg) {
+    (void)arg;
+    while (g_activo) {
+        pthread_mutex_lock(&g_cola.mutex);
+        
+        /* REQUISITO 7d: Esperar si no hay P oraciones o si los detectores aún están ocupados */
+        while ((g_cola.cantidad_actual < g_parametro_p || g_oraciones_en_lote > 0) && g_activo) {
+            pthread_cond_wait(&g_cola.cond_loader, &g_cola.mutex);
+        }
+        if (!g_activo) { pthread_mutex_unlock(&g_cola.mutex); break; }
+
+        /* Mueve exactamente P oraciones al Lote de Trabajo */
+        pthread_mutex_lock(&g_mutex_lote);
+        for(int i = 0; i < g_parametro_p; i++) {
+            g_lote_trabajo[i] = g_cola.buffer[g_cola.frente];
+            g_cola.frente = (g_cola.frente + 1) % MAX_COLA;
+            g_cola.cantidad_actual--;
+            g_oraciones_en_lote++;
+        }
+        
+        /* pthread_cond_broadcast despierta simultáneamente a todos los hilos detectores del Thread Pool */
+        pthread_cond_broadcast(&g_cond_detectores);
+        pthread_mutex_unlock(&g_mutex_lote);
+        pthread_mutex_unlock(&g_cola.mutex);
+    }
+    return NULL;
+}
+
+/* ─── HILO DE CONEXIÓN (PRODUCTOR V2) ─── 
+   Recibe caracteres asíncronos y arma la oración. No analiza palabras, solo alimenta la cola. */
 static void *hilo_conexion(void *arg) {
     int fd = *(int *)arg;
     free(arg);
     char buffer[TAM_MAX_MSG];
     ssize_t nbytes;
-    int id_ventana = -1;
-    RegistroDocumento *doc = NULL;
+    int id_ventana = fd; /* En un caso real usaríamos el ID del protocolo */
+
+    char oracion_local[TAM_MAX_ORACION] = "";
+    int pos_oracion = 0;
+
+    pthread_mutex_lock(&g_mutex_docs);
+    for (int i = 0; i < MAX_VENTANAS; i++) {
+        if (!g_documentos[i].en_uso) {
+            g_documentos[i].id_ventana = id_ventana;
+            g_documentos[i].en_uso = 1;
+            g_documentos[i].clase = CLASE_DESCONOCIDA;
+            g_documentos[i].evaluado = 0;
+            g_documentos[i].bolsa.tamano = 0;
+            pthread_mutex_init(&g_documentos[i].mutex, NULL);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_mutex_docs);
 
     while ((nbytes = recv(fd, buffer, sizeof(buffer) - 1, 0)) > 0) {
         buffer[nbytes] = '\0';
         char *guardado, *linea = strtok_r(buffer, "\n", &guardado);
 
         while (linea != NULL) {
-            if (strncmp(linea, PROTO_TOTAL, strlen(PROTO_TOTAL)) == 0) {
-                int total = atoi(linea + strlen(PROTO_TOTAL) + 1);
-                pthread_mutex_lock(&g_tabla.mutex);
-                
-                /* SOLUCION CONTEXTO: Limpiar la tabla de registros viejos cada que arranca el launcher */
-                for (int i = 0; i < MAX_VENTANAS; i++) {
-                    g_tabla.documentos[i].en_uso = 0;
-                    g_tabla.documentos[i].clase = CLASE_DESCONOCIDA;
-                    g_tabla.documentos[i].bolsa.tamano = 0;
-                    g_tabla.documentos[i].pos_palabra = 0;
-                    g_tabla.documentos[i].palabra_actual[0] = '\0';
-                }
-                g_tabla.terminados = 0;
-                g_tabla.total_esperado = total;
-                pthread_cond_broadcast(&g_tabla.cambio);
-                pthread_mutex_unlock(&g_tabla.mutex);
-                
-                CONSOLA_LOCK();
-                printf("\n[IALearner] Launcher informo: esperar %d ventana(s)\n", total);
-                CONSOLA_UNLOCK();
-                close(fd);
-                return NULL;
-            } 
-            else if (strncmp(linea, PROTO_ID, strlen(PROTO_ID)) == 0) {
-                id_ventana = atoi(linea + strlen(PROTO_ID) + 1);
-                pthread_mutex_lock(&g_tabla.mutex);
-                for (int i = 0; i < MAX_VENTANAS; i++) {
-                    if (!g_tabla.documentos[i].en_uso) {
-                        doc = &g_tabla.documentos[i];
-                        doc->id_ventana = id_ventana;
-                        doc->en_uso = 1;
-                        break;
-                    }
-                }
-                pthread_mutex_unlock(&g_tabla.mutex);
-                CONSOLA_LOCK();
-                printf("[IALearner] Ventana %d conectada\n", id_ventana);
-                CONSOLA_UNLOCK();
-            } 
-            else if (strncmp(linea, PROTO_CHAR, strlen(PROTO_CHAR)) == 0 && doc) {
+            if (strncmp(linea, PROTO_CHAR, strlen(PROTO_CHAR)) == 0) {
                 char c = linea[strlen(PROTO_CHAR) + 1];
-                pthread_mutex_lock(&doc->mutex);
-                if (c == ' ') {
-                    if (doc->pos_palabra > 0) {
-                        bolsa_agregar(&doc->bolsa, doc->palabra_actual);
-                        doc->pos_palabra = 0;
-                        doc->palabra_actual[0] = '\0';
-                    }
-                } else if (doc->pos_palabra < TAM_MAX_PALABRA - 1) {
-                    doc->palabra_actual[doc->pos_palabra++] = c;
-                    doc->palabra_actual[doc->pos_palabra] = '\0';
+                if (pos_oracion < TAM_MAX_ORACION - 1) {
+                    oracion_local[pos_oracion++] = c;
+                    oracion_local[pos_oracion] = '\0';
                 }
-                pthread_mutex_unlock(&doc->mutex);
             } 
-            else if (strncmp(linea, PROTO_RET, strlen(PROTO_RET)) == 0 && doc) {
-                /* Capturar si presionó enter antes de un espacio */
-                pthread_mutex_lock(&doc->mutex);
-                if (doc->pos_palabra > 0) {
-                    bolsa_agregar(&doc->bolsa, doc->palabra_actual);
-                    doc->pos_palabra = 0;
-                    doc->palabra_actual[0] = '\0';
+            else if (strncmp(linea, PROTO_RET, strlen(PROTO_RET)) == 0) {
+                /* REQUISITO 4: La oración terminó. Entra a la Cola Global protegida por mutex. */
+                if (pos_oracion > 0) {
+                    pthread_mutex_lock(&g_cola.mutex);
+                    strcpy(g_cola.buffer[g_cola.final].texto, oracion_local);
+                    g_cola.buffer[g_cola.final].id_ventana = id_ventana;
+                    g_cola.final = (g_cola.final + 1) % MAX_COLA;
+                    g_cola.cantidad_actual++;
+
+                    /* Si alcanzamos P oraciones, despertamos al Loader */
+                    if (g_cola.cantidad_actual >= g_parametro_p) {
+                        pthread_cond_signal(&g_cola.cond_loader);
+                    }
+                    pthread_mutex_unlock(&g_cola.mutex);
+                    
+                    pos_oracion = 0;
+                    oracion_local[0] = '\0';
                 }
-                pthread_mutex_unlock(&doc->mutex);
             }
             else if (strncmp(linea, PROTO_FIN, strlen(PROTO_FIN)) == 0) {
                 goto fin_ventana;
@@ -254,33 +294,48 @@ static void *hilo_conexion(void *arg) {
 
 fin_ventana:
     close(fd);
-    if (doc) {
-        pthread_mutex_lock(&doc->mutex);
-        if (doc->pos_palabra > 0) {
-            bolsa_agregar(&doc->bolsa, doc->palabra_actual);
+    /* Limpieza de la ventana al desconectar */
+    pthread_mutex_lock(&g_mutex_docs);
+    for (int i = 0; i < MAX_VENTANAS; i++) {
+        if (g_documentos[i].en_uso && g_documentos[i].id_ventana == id_ventana) {
+            g_documentos[i].en_uso = 0;
+            pthread_mutex_destroy(&g_documentos[i].mutex);
+            break;
         }
-        doc->clase = clasificar_documento(&doc->bolsa, id_ventana);
-        pthread_mutex_unlock(&doc->mutex);
-
-        pthread_mutex_lock(&g_tabla.mutex);
-        g_tabla.terminados++;
-        pthread_cond_broadcast(&g_tabla.cambio);
-        pthread_mutex_unlock(&g_tabla.mutex);
     }
+    pthread_mutex_unlock(&g_mutex_docs);
     return NULL;
 }
 
 int main(int argc, char *argv[]) {
-    int puerto = PUERTO_DEFECTO;
-    if (argc == 2) puerto = atoi(argv[1]);
+    /* El sistema ahora exige recibir el tamaño del lote (P) como parámetro. */
+    if(argc < 3) {
+        fprintf(stderr, "Uso: ./ia_learner <puerto> <P_oraciones>\n");
+        return EXIT_FAILURE;
+    }
+    int puerto = atoi(argv[1]);
+    g_parametro_p = atoi(argv[2]);
 
-    memset(&g_tabla, 0, sizeof(g_tabla));
-    pthread_mutex_init(&g_tabla.mutex, NULL);
-    pthread_cond_init(&g_tabla.cambio, NULL);
-    for (int i = 0; i < MAX_VENTANAS; i++) pthread_mutex_init(&g_tabla.documentos[i].mutex, NULL);
+    memset(g_documentos, 0, sizeof(g_documentos));
+    
+    /* Inicializamos estructuras de concurrencia de la Cola */
+    pthread_mutex_init(&g_cola.mutex, NULL);
+    pthread_cond_init(&g_cola.cond_loader, NULL);
+    g_cola.frente = 0; g_cola.final = 0; g_cola.cantidad_actual = 0;
 
-    pthread_t hilo_clf;
-    pthread_create(&hilo_clf, NULL, hilo_clasificador, NULL);
+    g_lote_trabajo = malloc(sizeof(Oracion) * g_parametro_p);
+
+    /* 1. Arranca el Hilo Orquestador (Loader) */
+    pthread_t loader;
+    pthread_create(&loader, NULL, hilo_loader, NULL);
+
+    /* 2. Arranca el Thread Pool: P hilos Detectores en estado de espera pasiva */
+    pthread_t *detectores = malloc(sizeof(pthread_t) * g_parametro_p);
+    for(int i = 0; i < g_parametro_p; i++) {
+        int *id = malloc(sizeof(int));
+        *id = i;
+        pthread_create(&detectores[i], NULL, hilo_detector, id);
+    }
 
     int fd_servidor = socket(AF_INET, SOCK_STREAM, 0);
     int opt = 1;
@@ -295,8 +350,11 @@ int main(int argc, char *argv[]) {
     bind(fd_servidor, (struct sockaddr *)&dir, sizeof(dir));
     listen(fd_servidor, MAX_VENTANAS);
 
-    printf("[IALearner] Escuchando en el puerto %d...\n\n", puerto);
+    CONSOLA_LOCK();
+    printf("Agentic-OS V2 Iniciado (Puerto %d | Limite de oraciones y nucleos P = %d)\n", puerto, g_parametro_p);
+    CONSOLA_UNLOCK();
 
+    /* Bucle infinito de Recepción de Clientes (Ventanas gráficas) */
     while (g_activo) {
         struct sockaddr_in cli;
         socklen_t len = sizeof(cli);
@@ -305,11 +363,14 @@ int main(int argc, char *argv[]) {
 
         int *arg = malloc(sizeof(int));
         *arg = fd_cliente;
+        
         pthread_t tid;
         pthread_create(&tid, NULL, hilo_conexion, arg);
-        pthread_detach(tid);
+        pthread_detach(tid); /* El hilo productor gestiona y libera su propia memoria al terminar */
     }
 
     close(fd_servidor);
+    free(g_lote_trabajo);
+    free(detectores);
     return EXIT_SUCCESS;
 }
