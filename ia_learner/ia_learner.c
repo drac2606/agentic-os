@@ -1,4 +1,4 @@
-#define _GNU_SOURCE /* Requerido obligatoriamente para habilitar la Afinidad de CPU en Linux */
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,8 +11,7 @@
 
 #include "../include/protocolo.h"
 
-/* ─── PROTECCIÓN DE CONSOLA ───
-   Evita que los printf de los detectores concurrentes se entrelacen en pantalla. */
+/* ─── CONTROL DE CONSOLA Y ESTADO GLOBAL ─── */
 static pthread_mutex_t g_mutex_consola = PTHREAD_MUTEX_INITIALIZER;
 #define CONSOLA_LOCK()   pthread_mutex_lock(&g_mutex_consola)
 #define CONSOLA_UNLOCK() pthread_mutex_unlock(&g_mutex_consola)
@@ -21,13 +20,15 @@ static volatile sig_atomic_t g_activo = 1;
 
 /* ─── VARIABLES GLOBALES V2 (ORQUESTACIÓN Y LOTES) ─── */
 static ColaOraciones g_cola;
-static int g_parametro_p = 0; /* Límite de hilos y tamaño exacto del lote a procesar */
+static int g_parametro_p = 0;
 
-/* Lote temporal donde el Loader extrae las P oraciones para los detectores */
 static Oracion *g_lote_trabajo;
 static int g_oraciones_en_lote = 0;
+static int g_detectores_completados = 0;
+
 static pthread_mutex_t g_mutex_lote = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_cond_detectores = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t g_cond_lote_terminado = PTHREAD_COND_INITIALIZER;
 
 /* ─── DICCIONARIOS Y BAG OF WORDS ─── */
 static const char *DICC_CORREO[] = {"thank", "please", "regards", "meeting", "attached", "information", "update", "schedule", "team", "project", NULL};
@@ -51,7 +52,7 @@ typedef struct {
     BolsaPalabras bolsa;
     ClaseDocumento clase;
     int evaluado;
-    pthread_mutex_t mutex; /* Mutex granular por ventana */
+    pthread_mutex_t mutex;
 } RegistroDocumento;
 
 static RegistroDocumento g_documentos[MAX_VENTANAS];
@@ -117,7 +118,7 @@ static ClaseDocumento clasificar_documento(BolsaPalabras *b) {
     return mejor_clase;
 }
 
-static TipoUsuario inferir_tipo_usuario_asincrono() {
+static TipoUsuario inferir_tipo_usuario_asincrono(void) {
     int correo = 0, articulo = 0, reporte = 0;
     
     pthread_mutex_lock(&g_mutex_docs);
@@ -137,29 +138,25 @@ static TipoUsuario inferir_tipo_usuario_asincrono() {
     return USUARIO_INDETERMINADO;
 }
 
-/* ─── HILO DETECTOR (CONSUMIDOR ASINCRÓNICO V2) ─── 
-   Requisito 7: Procesamiento simultáneo de oraciones limitados a P hilos. */
+/* ─── HILO DETECTOR (CONSUMIDOR ASINCRÓNICO V2) ─── */
 static void *hilo_detector(void *arg) {
     int id_hilo = *(int*)arg;
     free(arg);
 
-    /* REQUISITO 7a: Balancear la carga en CPUs disponibles (Afinidad de CPU) 
-       Asigna este hilo a un núcleo físico específico del procesador. */
+    /* Balanceo de carga en CPUs disponibles */
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
-    int num_cores = sysconf(_SC_NPROCESSORS_ONLN);
+    int num_cores = (int)sysconf(_SC_NPROCESSORS_ONLN);
     CPU_SET(id_hilo % num_cores, &cpuset);
     pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
 
     while (g_activo) {
         pthread_mutex_lock(&g_mutex_lote);
-        /* Espera pasiva: El hilo no consume CPU hasta que el Loader lo despierte */
         while (g_oraciones_en_lote == 0 && g_activo) {
             pthread_cond_wait(&g_cond_detectores, &g_mutex_lote);
         }
         if (!g_activo) { pthread_mutex_unlock(&g_mutex_lote); break; }
 
-        /* Extrae asincrónicamente una oración del lote simultáneamente con los demás hilos */
         Oracion mi_oracion = g_lote_trabajo[--g_oraciones_en_lote];
         pthread_mutex_unlock(&g_mutex_lote);
 
@@ -173,7 +170,7 @@ static void *hilo_detector(void *arg) {
         }
         pthread_mutex_unlock(&g_mutex_docs);
 
-        /* REQUISITO 7f: Evaluar asincrónicamente apenas se procesa la oración */
+        /* Bag of Words y Clasificación */
         if (doc) {
             pthread_mutex_lock(&doc->mutex);
             char *guardado, *palabra = strtok_r(mi_oracion.texto, " ", &guardado);
@@ -189,77 +186,93 @@ static void *hilo_detector(void *arg) {
                 
                 TipoUsuario tipo = inferir_tipo_usuario_asincrono();
                 CONSOLA_LOCK();
-                printf("\n[Hilo %d | CPU Core %d] Contexto Actualizado: %s\n", id_hilo, id_hilo % num_cores, NOMBRE_USUARIO[tipo]);
+                printf("\n[Hilo %d | CPU Core %d] Documento %d clasificado. Contexto Actualizado: %s\n",
+                       id_hilo, id_hilo % num_cores, mi_oracion.id_ventana, NOMBRE_USUARIO[tipo]);
                 CONSOLA_UNLOCK();
             }
             pthread_mutex_unlock(&doc->mutex);
         }
+
+        /* Notificar al Loader que la oración asignada fue procesada */
+        pthread_mutex_lock(&g_mutex_lote);
+        g_detectores_completados++;
+        if (g_detectores_completados == g_parametro_p) {
+            pthread_cond_signal(&g_cond_lote_terminado);
+        }
+        pthread_mutex_unlock(&g_mutex_lote);
     }
     return NULL;
 }
 
-/* ─── HILO LOADER (ORQUESTADOR DE LOTES V2) ─── 
-   Requisito 7e: Hilo dedicado a verificar si hay P oraciones listas para reactivar los hilos suspendidos. */
+/* ─── HILO LOADER (ORQUESTADOR DE LOTES V2) ─── */
 static void *hilo_loader(void *arg) {
     (void)arg;
     while (g_activo) {
         pthread_mutex_lock(&g_cola.mutex);
         
-        /* REQUISITO 7d: Esperar si no hay P oraciones o si los detectores aún están ocupados */
-        while ((g_cola.cantidad_actual < g_parametro_p || g_oraciones_en_lote > 0) && g_activo) {
+        /* Esperar hasta que se completen P oraciones en la cola */
+        while (g_cola.cantidad_actual < g_parametro_p && g_activo) {
             pthread_cond_wait(&g_cola.cond_loader, &g_cola.mutex);
         }
         if (!g_activo) { pthread_mutex_unlock(&g_cola.mutex); break; }
 
-        /* Mueve exactamente P oraciones al Lote de Trabajo */
         pthread_mutex_lock(&g_mutex_lote);
-        for(int i = 0; i < g_parametro_p; i++) {
+        for (int i = 0; i < g_parametro_p; i++) {
             g_lote_trabajo[i] = g_cola.buffer[g_cola.frente];
             g_cola.frente = (g_cola.frente + 1) % MAX_COLA;
             g_cola.cantidad_actual--;
             g_oraciones_en_lote++;
         }
-        
-        /* pthread_cond_broadcast despierta simultáneamente a todos los hilos detectores del Thread Pool */
+        g_detectores_completados = 0;
+
+        /* Despertar simultáneamente a los P detectores */
         pthread_cond_broadcast(&g_cond_detectores);
+
+        /* Esperar que el lote actual de P oraciones culmine antes del siguiente */
+        while (g_detectores_completados < g_parametro_p && g_activo) {
+            pthread_cond_wait(&g_cond_lote_terminado, &g_mutex_lote);
+        }
+
         pthread_mutex_unlock(&g_mutex_lote);
         pthread_mutex_unlock(&g_cola.mutex);
     }
     return NULL;
 }
 
-/* ─── HILO DE CONEXIÓN (PRODUCTOR V2) ─── 
-   Recibe caracteres asíncronos y arma la oración. No analiza palabras, solo alimenta la cola. */
+/* ─── HILO DE CONEXIÓN (PRODUCTOR V2) ─── */
 static void *hilo_conexion(void *arg) {
     int fd = *(int *)arg;
     free(arg);
     char buffer[TAM_MAX_MSG];
     ssize_t nbytes;
-    int id_ventana = fd; /* En un caso real usaríamos el ID del protocolo */
+    int id_ventana = -1;
 
     char oracion_local[TAM_MAX_ORACION] = "";
     int pos_oracion = 0;
-
-    pthread_mutex_lock(&g_mutex_docs);
-    for (int i = 0; i < MAX_VENTANAS; i++) {
-        if (!g_documentos[i].en_uso) {
-            g_documentos[i].id_ventana = id_ventana;
-            g_documentos[i].en_uso = 1;
-            g_documentos[i].clase = CLASE_DESCONOCIDA;
-            g_documentos[i].evaluado = 0;
-            g_documentos[i].bolsa.tamano = 0;
-            pthread_mutex_init(&g_documentos[i].mutex, NULL);
-            break;
-        }
-    }
-    pthread_mutex_unlock(&g_mutex_docs);
 
     while ((nbytes = recv(fd, buffer, sizeof(buffer) - 1, 0)) > 0) {
         buffer[nbytes] = '\0';
         char *guardado, *linea = strtok_r(buffer, "\n", &guardado);
 
         while (linea != NULL) {
-            if (strncmp(linea, PROTO_CHAR, strlen(PROTO_CHAR)) == 0) {
+            if (strncmp(linea, PROTO_ID, strlen(PROTO_ID)) == 0) {
+                id_ventana = atoi(linea + strlen(PROTO_ID) + 1);
+                
+                pthread_mutex_lock(&g_mutex_docs);
+                for (int i = 0; i < MAX_VENTANAS; i++) {
+                    if (!g_documentos[i].en_uso) {
+                        g_documentos[i].id_ventana = id_ventana;
+                        g_documentos[i].en_uso = 1;
+                        g_documentos[i].clase = CLASE_DESCONOCIDA;
+                        g_documentos[i].evaluado = 0;
+                        g_documentos[i].bolsa.tamano = 0;
+                        pthread_mutex_init(&g_documentos[i].mutex, NULL);
+                        break;
+                    }
+                }
+                pthread_mutex_unlock(&g_mutex_docs);
+            }
+            else if (strncmp(linea, PROTO_CHAR, strlen(PROTO_CHAR)) == 0) {
                 char c = linea[strlen(PROTO_CHAR) + 1];
                 if (pos_oracion < TAM_MAX_ORACION - 1) {
                     oracion_local[pos_oracion++] = c;
@@ -267,15 +280,15 @@ static void *hilo_conexion(void *arg) {
                 }
             } 
             else if (strncmp(linea, PROTO_RET, strlen(PROTO_RET)) == 0) {
-                /* REQUISITO 4: La oración terminó. Entra a la Cola Global protegida por mutex. */
-                if (pos_oracion > 0) {
+                /* Fin de oración -> Encolado concurrente */
+                if (pos_oracion > 0 && id_ventana != -1) {
                     pthread_mutex_lock(&g_cola.mutex);
-                    strcpy(g_cola.buffer[g_cola.final].texto, oracion_local);
+                    strncpy(g_cola.buffer[g_cola.final].texto, oracion_local, TAM_MAX_ORACION - 1);
+                    g_cola.buffer[g_cola.final].texto[TAM_MAX_ORACION - 1] = '\0';
                     g_cola.buffer[g_cola.final].id_ventana = id_ventana;
                     g_cola.final = (g_cola.final + 1) % MAX_COLA;
                     g_cola.cantidad_actual++;
 
-                    /* Si alcanzamos P oraciones, despertamos al Loader */
                     if (g_cola.cantidad_actual >= g_parametro_p) {
                         pthread_cond_signal(&g_cola.cond_loader);
                     }
@@ -294,22 +307,22 @@ static void *hilo_conexion(void *arg) {
 
 fin_ventana:
     close(fd);
-    /* Limpieza de la ventana al desconectar */
-    pthread_mutex_lock(&g_mutex_docs);
-    for (int i = 0; i < MAX_VENTANAS; i++) {
-        if (g_documentos[i].en_uso && g_documentos[i].id_ventana == id_ventana) {
-            g_documentos[i].en_uso = 0;
-            pthread_mutex_destroy(&g_documentos[i].mutex);
-            break;
+    if (id_ventana != -1) {
+        pthread_mutex_lock(&g_mutex_docs);
+        for (int i = 0; i < MAX_VENTANAS; i++) {
+            if (g_documentos[i].en_uso && g_documentos[i].id_ventana == id_ventana) {
+                g_documentos[i].en_uso = 0;
+                pthread_mutex_destroy(&g_documentos[i].mutex);
+                break;
+            }
         }
+        pthread_mutex_unlock(&g_mutex_docs);
     }
-    pthread_mutex_unlock(&g_mutex_docs);
     return NULL;
 }
 
 int main(int argc, char *argv[]) {
-    /* El sistema ahora exige recibir el tamaño del lote (P) como parámetro. */
-    if(argc < 3) {
+    if (argc < 3) {
         fprintf(stderr, "Uso: ./ia_learner <puerto> <P_oraciones>\n");
         return EXIT_FAILURE;
     }
@@ -318,20 +331,17 @@ int main(int argc, char *argv[]) {
 
     memset(g_documentos, 0, sizeof(g_documentos));
     
-    /* Inicializamos estructuras de concurrencia de la Cola */
     pthread_mutex_init(&g_cola.mutex, NULL);
     pthread_cond_init(&g_cola.cond_loader, NULL);
     g_cola.frente = 0; g_cola.final = 0; g_cola.cantidad_actual = 0;
 
     g_lote_trabajo = malloc(sizeof(Oracion) * g_parametro_p);
 
-    /* 1. Arranca el Hilo Orquestador (Loader) */
     pthread_t loader;
     pthread_create(&loader, NULL, hilo_loader, NULL);
 
-    /* 2. Arranca el Thread Pool: P hilos Detectores en estado de espera pasiva */
     pthread_t *detectores = malloc(sizeof(pthread_t) * g_parametro_p);
-    for(int i = 0; i < g_parametro_p; i++) {
+    for (int i = 0; i < g_parametro_p; i++) {
         int *id = malloc(sizeof(int));
         *id = i;
         pthread_create(&detectores[i], NULL, hilo_detector, id);
@@ -345,7 +355,7 @@ int main(int argc, char *argv[]) {
     memset(&dir, 0, sizeof(dir));
     dir.sin_family = AF_INET;
     dir.sin_addr.s_addr = INADDR_ANY;
-    dir.sin_port = htons(puerto);
+    dir.sin_port = htons((uint16_t)puerto);
 
     bind(fd_servidor, (struct sockaddr *)&dir, sizeof(dir));
     listen(fd_servidor, MAX_VENTANAS);
@@ -354,7 +364,6 @@ int main(int argc, char *argv[]) {
     printf("Agentic-OS V2 Iniciado (Puerto %d | Limite de oraciones y nucleos P = %d)\n", puerto, g_parametro_p);
     CONSOLA_UNLOCK();
 
-    /* Bucle infinito de Recepción de Clientes (Ventanas gráficas) */
     while (g_activo) {
         struct sockaddr_in cli;
         socklen_t len = sizeof(cli);
@@ -366,7 +375,7 @@ int main(int argc, char *argv[]) {
         
         pthread_t tid;
         pthread_create(&tid, NULL, hilo_conexion, arg);
-        pthread_detach(tid); /* El hilo productor gestiona y libera su propia memoria al terminar */
+        pthread_detach(tid);
     }
 
     close(fd_servidor);
